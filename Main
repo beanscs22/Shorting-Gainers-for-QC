@@ -1,0 +1,282 @@
+# region imports
+from AlgorithmImports import *
+# detects extremely overbought things
+class Shortsell(QCAlgorithm):
+   
+    # portfolio config
+    FREE_CASH = 0.20 # adjust based on risk tolerance, 0.7 yields large gains
+    STARTING_CASH = 100000
+   
+    # signal config
+    FAST = 4 #lower value yields higher risk but also reward
+    SLOW = 30 
+    MAGNITUDE = 2.0
+   
+    # position configuration
+    CUT_LOSS = -0.1 # -0.1% optimal
+    TAKE_PROFIT = 0.55 # 0.55 optimal
+    REBALANCE_BP = 0.25 # adjust based on risk tolerance
+    MAX_POSITION_SIZE = -0.10 # big effect on total returns (more negative values = larger returns)
+    MAX_POSITION_AGE = 45 # 45 days optimal
+    MIN_TIME_IN_UNIVERSE = 730 # (2 years)
+   
+   
+    MIN_VOLUME = 1000000
+    MIN_DOLLAR_VOLUME = 100000
+    OF_TOTAL_DV = 0.05
+   
+    class SecurityData:
+       
+        def __init__(self, symbol, history):
+            self.symbol = symbol
+            self.fast = ExponentialMovingAverage(Shortsell.FAST)
+            self.slow = ExponentialMovingAverage(Shortsell.SLOW)
+            self.vol = ExponentialMovingAverage(Shortsell.SLOW)
+           
+            self.isBubble = False
+            self.ratio = 0
+           
+            for bar in history.itertuples():
+                self.fast.Update(bar.Index[1], bar.close)
+                self.slow.Update(bar.Index[1], bar.close)
+                self.vol.Update(bar.Index[1], ((bar.open + bar.close)/2.0) * bar.volume) # approx. dollar volume
+       
+        def update(self, time, price, volume):
+            if self.fast.Update(time, price) and self.slow.Update(time, price) and self.vol.Update(time, volume):
+                self.isBubble = (self.fast.Current.Value > (Shortsell.MAGNITUDE * self.slow.Current.Value)) and (price > self.slow.Current.Value)
+                self.ratio = self.fast.Current.Value/self.slow.Current.Value
+           
+
+
+    def Initialize(self):
+        self.Debug("Shortsell")
+        self.SetTimeZone("America/New_York")
+        self.SetBrokerageModel(BrokerageName.AlphaStreams)
+       
+        
+        self.SetStartDate(2015, 1, 1)  
+    
+        # portfolio
+        self.Settings.FreePortfolioValuePercentage = Shortsell.FREE_CASH
+        self.SetCash(Shortsell.STARTING_CASH)
+       
+        # universe
+        self.UniverseSettings.Resolution = Resolution.Hour
+        self.UniverseSettings.MinimumTimeInUniverse = Shortsell.MIN_TIME_IN_UNIVERSE
+        self.AddUniverse(self.UniverseSelection)
+       
+        self.universe = {} # contains all tracked securities in the universe
+        self.expiry = {} # contains age of position
+        self.bp = 1.00 # buying power
+        self.open = [] # positions to open based on signal
+   
+   
+
+
+       def DailyAt10(self):
+             
+       
+        for symb in self.open:
+            dynamic = -0.25/(len([f.Key for f in self.ActiveSecurities if f.Value.Invested]) + 1.00)
+            target = max(Shortsell.MAX_POSITION_SIZE, dynamic) # max of negative
+            tag = "New pos. target allocation {}".format(round(target, 4))
+            self.Short(symb, target, tag)
+               
+        self.open = []
+       
+        self.bp = self.Portfolio.MarginRemaining/self.Portfolio.TotalPortfolioValue
+        self.Plot("Buying Power", "Val", self.bp)
+        self.Plot("# Positiions", "Val", len([x.Key for x in self.ActiveSecurities if x.Value.Invested]))
+       
+   
+   
+    def Rebalance(self):
+       
+        closing = set()
+        invested = [f.Key for f in self.ActiveSecurities if f.Value.Invested]
+        for symb in invested:
+            holding = self.Portfolio[symb]
+       
+            # exit old positions
+            if (self.Time - self.expiry[holding.Symbol]).days > Shortsell.MAX_POSITION_AGE:
+                self.Debug("{} Expired {} at {} days, {}%".format(self.Time, holding.Symbol, (self.Time - self.expiry[holding.Symbol]).days, round(holding.UnrealizedProfitPercent, 4) * 100))
+                self.CancelAllOrders(holding.Symbol)
+                tag = "Expired, age {} days, result {}%".format((self.Time - self.expiry[holding.Symbol]).days, round(holding.UnrealizedProfitPercent, 4) * 100)
+                self.RapidExit(holding.Symbol, tag)
+                closing.add(holding.Symbol)
+               
+            # exit positions with a large loss
+            elif (holding.UnrealizedProfitPercent < Shortsell.CUT_LOSS) and ((self.Time - self.expiry[symb]).days > 1):
+                self.Debug("{} Cutting Losses on {} at {} days, {}%".format(self.Time, holding.Symbol, (self.Time - self.expiry[holding.Symbol]).days, round(holding.UnrealizedProfitPercent, 4) * 100))
+                self.CancelAllOrders(holding.Symbol)
+                tag = "Cutting loss, age {} days, result {}%".format((self.Time - self.expiry[holding.Symbol]).days, round(holding.UnrealizedProfitPercent, 4) * 100)
+                self.RapidExit(holding.Symbol, tag)
+                closing.add(holding.Symbol)
+       
+            # exit positions with a large profit
+            elif (holding.UnrealizedProfitPercent > Shortsell.TAKE_PROFIT):
+                self.Debug("{} Taking Profit on {} at {} days, {}%".format(self.Time, holding.Symbol, (self.Time - self.expiry[holding.Symbol]).days, round(holding.UnrealizedProfitPercent, 4) * 100))
+                self.CancelAllOrders(holding.Symbol)
+                tag = "Taking profit, age {} days, result {}%".format((self.Time - self.expiry[holding.Symbol]).days, round(holding.UnrealizedProfitPercent, 4) * 100)
+                self.Cover(holding.Symbol, tag)
+                closing.add(holding.Symbol)
+               
+   
+        # liquidate most profitable position if buying power is too low
+        self.bp = self.Portfolio.MarginRemaining/self.Portfolio.TotalPortfolioValue
+        if self.bp < Shortsell.REBALANCE_BP:
+            self.Debug("{} Rebalancing, buying power: {}".format(self.Time, self.bp))
+     
+            class Factor:
+                def __init__(self, holding):
+                    self.holding = holding
+                    self.unrealized = self.holding.UnrealizedProfitPercent
+           
+            track = {}
+            for symb in invested:
+                holding = self.Portfolio[symb]
+                track[holding.Symbol] = Factor(holding)
+           
+            values = list(set(track.values()) - set(closing)) 
+            if len(values) > 0:
+                values.sort(key=lambda f: f.unrealized, reverse=True)
+                self.Debug("{} Liquidating {} @ {}".format(self.Time, values[0].holding.Symbol, values[0].unrealized))
+                self.CancelAllOrders(values[0].holding.Symbol)
+                tag = "Liquidating, age {} days, result {}%".format((self.Time - self.expiry[holding.Symbol]).days, round(holding.UnrealizedProfitPercent, 4) * 100)
+                self.RapidExit(values[0].holding.Symbol, tag)
+            else:
+                self.Error("{} Unable to liquidate: {} {}".format(self.Time, len(values), len(closing)))
+       
+               
+    # runs at hourly resolution when securities in universe
+    def OnData(self, slice):
+        self.Rebalance()
+       
+        # at 10:00 AM daily
+        if self.Time.hour == 10:
+            self.DailyAt10()
+       
+
+
+        def OnSecuritiesChanged(self, changes):
+        
+       
+        self.open = []
+        for security in changes.AddedSecurities:
+            self.CancelAllOrders(security.Symbol)
+            if not security.Invested:
+                self.Debug("{} Added Security {}".format(self.Time, security.Symbol))
+                self.open.append(security.Symbol)
+   
+            else:
+                self.Error("{} Adding security already invested in {}".format(self.Time, security.Symbol))
+           
+
+
+    def UniverseSelection(self, coarse):
+               
+               hard = list(filter(lambda c: (c.Market == "usa") and (c.Price > 5) and (c.HasFundamentalData), coarse))
+       
+        # save coarse fundamentals to dict
+        current = {}
+        for h in hard:
+            current[h.Symbol] = h
+       
+        # apply soft filtering criteria
+        soft = list(filter(lambda h: (h.Volume > Shortsell.MIN_VOLUME) and (h.DollarVolume > Shortsell.MIN_DOLLAR_VOLUME), hard))
+       
+        # add new symbols to universe
+        for s in soft:
+            if (s.Symbol not in self.universe):
+                history = self.History(s.Symbol, Shortsell.SLOW, Resolution.Daily)
+                self.universe[s.Symbol] = Shortsell.SecurityData(s.Symbol, history)
+               
+        # update security data objs and remove any securities no longer in universe
+        new = {}
+        for symb in self.universe:
+            sd = self.universe[symb]
+            if symb in current:
+                sd.update(current[symb].EndTime, current[symb].AdjustedPrice, current[symb].DollarVolume)
+                new[symb] = sd
+               
+        self.universe = new
+        remaining = list(filter(lambda sd: sd.isBubble, self.universe.values()))
+        remaining.sort(key = lambda sd: sd.ratio, reverse = True)
+        selected = [ sd.symbol for sd in remaining ]
+       
+        return selected
+       
+       
+    def CancelAllOrders(self, symbol):        
+        openOrders = self.Transactions.CancelOpenOrders(symbol)
+        for oo in openOrders:
+            if not (oo.Status == OrderStatus.CancelPending):
+                r = oo.Cancel()
+                if not r.IsSuccess:
+                    self.Error("{} Failed to cancel open order {} of {} for reason: {}, {}".format(self.Time, oo.Quantity, oo.Symbol, r.ErrorMessage, r.ErrorCode))
+                   
+
+
+    def Short(self, symbol, target, tag = "No Tag Provided"):
+        q = int(self.CalculateOrderQuantity(symbol, target))
+        price = float(self.Securities[symbol].Close)
+       
+        odv = float(abs(q * price)) # order dollar volume
+        rdv = float(Shortsell.OF_TOTAL_DV * self.universe[symbol].vol.Current.Value)  
+      
+        if (odv < rdv):
+            if q < 0:
+                
+                self.EmitInsights(Insight.Price(symbol, timedelta(days = Shortsell.MAX_POSITION_AGE), InsightDirection.Down, None, None, None, target))
+                self.LimitOrder(symbol, q, price, tag)
+            else:
+                if q != 0:
+                    self.Error("{} Received positive quantity for short order: {} {} @ {} (Target: {})".format(self.Time, q, symbol, price, target))
+        else:
+            self.Debug("{} Skipping {}, poor liquidity: {} > {}".format(self.Time, symbol, odv, rdv))
+
+
+
+
+    def Cover(self, symbol, tag = "No Tag Provided"):
+        q = -1 * int(self.Portfolio[symbol].Quantity)
+        price = self.Securities[symbol].Close
+        if q > 0:
+            
+            self.EmitInsights(Insight.Price(symbol, timedelta(days = Shortsell.MAX_POSITION_AGE), InsightDirection.Flat, None, None, None, 0.00))
+            self.LimitOrder(symbol, q, price, tag)
+        else:
+            if q != 0:
+                self.Error("{} Received negative quantity for cover order: {} {} @ {}".format(self.Time, q, symbol, price))
+       
+
+
+    def RapidExit(self, symbol, tag = "No Tag Provided"):
+        q = -1 * int(self.Portfolio[symbol].Quantity)
+        if q > 0:
+                        self.EmitInsights(Insight.Price(symbol, timedelta(days = Shortsell.MAX_POSITION_AGE), InsightDirection.Flat, None, None, None, 0.00))
+            self.MarketOrder(symbol, q, False, tag)
+        else:
+            if q != 0:
+                self.Error("{} Received negative quantity for rapid exit order: {} {}".format(self.Time, q, symbol))
+       
+       
+    def OnOrderEvent(self, orderEvent):
+        if orderEvent.Status == OrderStatus.Filled:
+            order = self.Transactions.GetOrderById(orderEvent.OrderId)
+                       
+            # if completely liquidating position, stop tracking position age
+            if not self.Portfolio[order.Symbol].Invested:
+                try:
+                    del self.expiry[order.Symbol]
+                    
+                except Error:
+                    self.Error("{} Key deletion failed for {}".format(self.Time, order.Symbol))
+           
+            # if position is completely new, start tracking position age
+            else:
+                if (order.Symbol not in self.expiry):
+                    self.expiry[order.Symbol] = self.Time
+                else:
+                    self.Debug("{} Key already existed for {}".format(self.Time, order.Symbol))
+
